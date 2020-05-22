@@ -1,0 +1,312 @@
+---
+title: "DM - Master Big Data - Régression non-paramétrique"
+author: "Jeremy BRON"
+date: "08 janvier 2018"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1 - Exploration des propriétés de $g(x)$
+
+
+## 1.1
+
+Visualisation des données de X à l'aide d'un histogramme
+
+```{r, echo = F}
+ggplot(data = d, aes(X)) + 
+  geom_histogram(
+    fill = I("blue"),
+    col = I("red"),
+    bins = 50
+  ) +
+  labs(title="Histogramme de X") +
+  labs(x="X", y="Count") +
+  theme(plot.title = element_text( size=13, face="bold"),
+        axis.title.x = element_text(size=10),
+        axis.title.y = element_text(size=10))
+```
+
+La distribution des X est centrée et biaisée vers la droite. La figure suivante représente la densité estimée à partir de la fonction R pour la comparer à une approche par noyaux de la fonction bkde avec plusieurs paramètres h.
+
+
+```{r, echo = F}
+res1=bkde(d$X, kernel = "normal",canonical=FALSE, bandwidth=.15,gridsize = 500, truncate = TRUE)
+res2=bkde(d$X, kernel = "normal",canonical=FALSE, bandwidth=.05,gridsize = 500, truncate = TRUE)
+res3=bkde(d$X, kernel = "normal",canonical=FALSE, bandwidth=.01,gridsize = 500, truncate = TRUE)
+plot(density(d$X),xlim = c(-.5,1), xlab = "X", main = "Estimateur non paramétrique de X")
+lines(res1$x,res1$y, col ="red")
+lines(res2$x,res2$y, col ="blue")
+lines(res3$x,res3$y, col ="green")
+```
+
+* Si h est trop grand (h = 0,15 en rouge), l'estimateur est très régulier, mais biaisé, plus h est grand pour la densité estimée est plate.
+* Si h est trop petit (h= 0,01 en vert), l'estimateur est oscillant (grande variance), mais avec un faible biais. On voit bien que la courbe verte oscille autour de la densité estimée par R en noir.
+* Quand la valeur d’h se rapproche de la valeur optimale (h = 0.05 en bleu), la courbe se rapproche de la densité des données, sans osciller.
+
+## 1.2
+
+Au vu des plots d'estimateurs précédents, on réduit la fenêtre de recherche de h à [0.01,0.05].  
+
+
+```{r}
+#fonction du cours
+grid=seq(0.01,0.05,length=5)
+# h_grid=CVbwt(grid,d$X,d$Y)
+plot(grid,h_grid,type="l")
+#package sm
+h.select(d$X)
+```
+
+* Graphiquement, la valeur de h optimale se situe environ entre 0.03 et 0.04.
+* Le package sm propose une fonction pour calculer directement le h optimal: h = 0.02994713
+
+```{r, echo = F}
+reso=bkde(d$X, kernel = "normal",canonical=FALSE, bandwidth=0.02994713,gridsize = 500, truncate = TRUE)
+plot(density(d$X),xlim = c(-.5,1),xlab = "X", main = "Estimateur non paramétrique de X")
+lines(reso$x,reso$y, col ="red")
+```
+
+La densité avec ce paramètre h est très similaire avec celle estimée par la fonction densité de R sur les données. On estime donc bien la densité avec ce paramètre.
+
+## 1.3
+
+
+```{r, echo = F}
+qqplot(d$X, runif(10000))
+```
+
+* le QQ-plot illustre que $ g(x) \leq 1 $ pour tout x sur [0,1]
+* le graphique n'est pas linéaire et on voit bien un plus faible nombre de points pour X > 0.7 : l'hypothèse selon laquelle g est uniforme n'est pas raisonnable.
+
+# 2 - Reconstruction de $r(x)$
+##2.1
+
+```{r}
+plot(d, col=rgb(0,0,0,alpha=0.3) , pch = 20)
+```
+
+La représentation des données laisse pensé que r est linéaire par morceaux et non simplement linéaire:
+* Pour X entre 0 et 0.5 la pente est faible
+* Pour X entre 0.5 et 0.8 : la pente est plus forte que pour l'intervalle précédent
+* Pour X supérieurs à 0.8 : la pente est faible, voire nulle.
+
+L'estimation non paramétrique de r par des polynômes locaux, avec ici par exemple de polynômes d'ordre 1 (linéaires), serait donc une première étape nécessaire pour implémenter un modèle linéaire par morceaux.
+
+##2.2
+
+```{r}
+resQ2.a = ksmooth(d$X,d$Y,bandwidth=0.5,x.points=d$X)
+resQ2.b = ksmooth(d$X,d$Y,bandwidth=0.1,x.points=d$X)
+resQ2.c = ksmooth(d$X,d$Y,bandwidth=0.01,x.points=d$X)
+plot(d, col=rgb(0,0,0,alpha=0.3) , pch = 20)
+lines(resQ2.c$x,resQ2.c$y, col ="green")
+lines(resQ2.b$x,resQ2.b$y, col ="blue")
+lines(resQ2.a$x,resQ2.a$y, col ="red")
+```
+
+
+* Pour h = 0.5 : h est trop grand la densité estimée est ne prends pas en compte le changement de pente pour X > 0.5. La courbe est aplatie.
+* Pour h = 0.1 : h est plutôt adapté, l'estimation prend en comptes la tendance des données sans se mettre à osciller
+* Pour h = 0.01 : h est trop petit, l'estimation oscille légèrement entre 0 et 0.7; entre 0.7 et 1 : le jeu de donnée contient moins de points et l'estimation oscille plus fortement.
+
+
+##2.3.A
+
+```{r}
+# (a) - Directement avec le package SM
+h.select(d$X,d$Y, method = "cv")
+```
+
+
+```{r}
+resQ2.3 = ksmooth(d$X,d$Y,bandwidth=0.01491244,x.points=d$X)
+plot(d, col=rgb(0,0,0,alpha=0.3) , pch = 20)
+lines(resQ2.3$x,resQ2.3$y, col ="green")
+```
+
+
+* Dans le cas d'un h unique pour toutes les données la valeur de h est légèrement trop petite, cela provoque des oscillations mineures entre 0 et 0.7 et de plus fortes oscillations entre 0.7 et 1.
+
+##2.3.B
+
+Avec la fonction spill sur des blocs locaux et la fonction du cours, on recherche le h local pour 5 blocs
+
+```{r}
+h_CVloc(d$X,d$Y,5)$h_loc
+```
+
+À première vue, cela permet de sélectionner des h plus grands, surtout quand X augmente: là où il y a moins de données (donc plus de variance pour h trop petit)
+
+```{r}
+#découpage des données en blocks contenant le même nombre de points
+block = 5
+resQ23b =list()
+X_sort=sort(d$X)
+Y_sort=d$Y[order(d$X)]
+#calcul des estimateur sur chaques blocks
+for (i in 0:(block-1)) {
+  n = NROW(d)/block
+  resQ23b[[i+1]] = ksmooth(X_sort[(1+n*i):(n*(1+i))],
+                           Y_sort[(1+n*i):(n*(1+i))],
+                           bandwidth=hlock$h_loc[i+1],
+                           x.points=d$X[(1+n*i):(n*(1+i))])
+}
+
+plot(d, col=rgb(0,0,0,alpha=0.3) , pch = 20)
+for (i in 1:5) {
+  lines(resQ23b[[i]]$x,resQ23b[[i]]$y, col =i+1)
+}
+```
+
+Les estimations débordent entre elles aux bornes des blocs, on filtre les données pour garder seulement les valeurs de l'estimateur dont les X sont compris dans les blocs.
+
+```{r}
+plot(d, col=rgb(0,0,0,alpha=0.3) , pch = 20)
+
+for (i in 0:(block-1)) {
+  resfilter = as.data.frame(resQ23b[[i+1]]) %>% 
+    filter(x <= max(X_sort[(1+n*i):(n*(1+i))])) %>% 
+    filter(x >= min(X_sort[(1+n*i):(n*(1+i))]))
+  
+  lines(resfilter$x,resfilter$y, col =i+2)}
+```
+
+Tous les blocs contiennent le même nombre de points. Le h local permet de mieux adapter la fenêtre aux données et limite les oscillations qui paraissent avec le h unique précédent.
+On remarque aussi que ma distribution des X n'est pas uniforme avec le 5eme bloc (en violet) s'étends sur les C de 0.5 à 1.
+
+Remarque : On aurait pu découper les données plus intelligemment, non pas en blocs avec le même nombre de points mais selon les variations de la pente estimée de Y
+
+Globalement on préférera un choix local mieux adapté aux données ici.
+
+
+# 3 - Étude de la loi des $\xi i$
+
+
+## 3.1
+```{r}
+# on pose N = n-1
+U_n = function(Y,N){
+    sum((Y[2:(N+1)]-Y[1:N])**2)/(2*(N-1))
+  }
+
+V_n = function(X,Y,N){
+  X_sort=sort(X)
+  Y_sort=Y[order(X)]
+  sum((Y_sort[2:(N+1)]-Y_sort[1:N])**2)/(2*(N-1))
+}
+
+U_n(d$Y,9999)
+V_n(d$X,d$Y,9999)
+```
+
+## 3.2
+
+```{r}
+var(d$Y)
+```
+
+* $U_{n}$ (pour n = 10000) est proche de la variance de variance d’Y. On peut inférerez que $U_{n}$ est un estimateur de la variance des Y. U_n(Y)
+* $V_{n}$ pour des valeurs ordonnées selon X, lors du développement des $\widetilde{Y}_{n+1} - \widetilde{Y}_{n}$,  les valeurs de $r(X)_{i+1} - r(X)_{i}$ sont très proches et s'annulent grâce à l'espérance; alors que les $\xi i$ dont $\mathbb{E}[\xi i] = \sigma^{2} = 1$ sont conservés. $V_{n}$ estime donc la variance des X et est proche de 1.
+
+
+## 3.3
+
+```{r}
+X_sort=sort(d$X)
+Y_sort=d$Y[order(d$X)]
+hlock2 = h_CVloc(d$X,d$Y,2)
+resQ33b = ksmooth(X_sort[5001:10000],Y_sort[5001:10000],bandwidth=hlock2$h_loc[2],x.points=X_sort[5001:10000])
+Ytilde = Y_sort[5001:10000] - resQ33b$y
+plot(Ytilde ,col=rgb(0,0,0,alpha=0.3) , pch = 20)
+mean(Ytilde)
+var(Ytilde)
+plot(density(Ytilde) ,col=rgb(0,0,0,alpha=0.3) , pch = 20)
+lines(density(rnorm(5000)), col = "red")
+```
+
+la densité des $\widetilde{Y}$ ressemble fortement à une loi normale (0,1).
+
+## 3.4
+
+```{r}
+plot(rnorm(5000),col=rgb(0,0,0,alpha=0.3) , pch = 20)
+```
+
+
+## 3.5
+
+
+```{r}
+shapiro.test(Ytilde)
+#Test d'Anderson-Darling
+ad.test(Ytilde)
+#TCramer-von Mises test
+cvm.test(Ytilde, "pnorm", mean=0, sd=1)
+```
+
+l'hypothèse que $\widetilde{Y}$ suit une loi normale.
+
+* Le test d'Anderson-Darling qui privilégie les extremums de la distribution donne un résultat similaire ou l'on rejette l'hypothèse de normalité
+* Le test de Cramer-von Mises n'est pas concluent et on ne peut par rejeter l'hypothèse de normalité.
+
+
+On peut vérifier à l'aide d'un QQplot
+
+
+```{r, echo = F}
+qqnorm(Ytilde)
+```
+
+Les quantiles extrêmes divergent de la ligne droite. Il semble que ce sont ces valeurs qui font échouer les testes de normalités bien que la distribution des $ \widetilde{Y} $ ressemble fortement à une loi normale (0,1). Les approximations numériques successivement utiliser pour générer les $ X_i$ , les $ Y_i$ et les $ \widetilde{Y} $ ont peut-être engendrer des données dont les testes rejette l'hypothèse initiale de normalité, même les données simulées à la base étaient issus d'une distribution normale
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
