@@ -1,0 +1,1424 @@
+---
+title: "DM - Statistique Bayesienne"
+author: "Jeremy Bron"
+date: "Mai 2019"
+output: 
+  html_document:
+    toc: TRUE 
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+opts_chunk$set(echo=FALSE,cache=TRUE,warning = FALSE,options(digits=4),message = FALSE,tidy=TRUE)
+```
+
+Liste des packages utilisés:
+
+```{r ,echo=TRUE}
+
+setwd("C:/Users/jb/Google Drive/BIG DATA DAUPHINE/Bayésien")
+mut = read.csv("mutations2.csv")
+require(zoo)
+library(caret)
+library(tidyverse)
+library(yarrr)
+require(stats)
+library(knitr)
+require(ggpubr)
+library(BAS)
+library(monomvn)
+library(glmnet)
+library(reshape2)
+library(VGAM)
+library(ggdistribute)
+library(HDInterval)
+library(gridExtra)
+library(goftest)
+library(RVAideMemoire)
+
+Load_data = T #mettre FALSE pour recalculer les procédures, sinon les résultats seront chargés
+```
+
+
+# 0 - Description et visualisation des données
+
+## 0.1 - Structure des données et des couples Matières / Établissements
+
+
+```{r , include = F, echo=T}
+glimpse(mut)
+```
+
+Le fichier `mutation2.csv` contient 23 variables et 516 individus. Les 5 premières variables sont qualitatives et renseignent l'établissement, les matières concernées et d'autres paramètres identifiants les établissements (ville, code, etc.). À noter que la variable `établissement` ne renseigne pas les établissements de façon unique, car plusieurs noms sont similaires pour des lycées de différentes communes. Dans la suite de l'étude, la variable `code_etablissement` sera utilisée comme référence.
+
+Les 18 variables suivantes sont numériques en renseignent les caractéristiques de chaque couple (établissement, matière), notamment les effectifs, taux de réussite et d'accès aux fillaires et la variable réponse `Barre` qui indique le nombre de points nécessaire pour une mutation dans un couple donné.
+
+Notre analyse porte sur 35 matières réparties dans 107 établissements. Ainsi les données ne contiennent pas toutes les matières pour chaque établissement.
+
+Le graphique ci-dessous illustre la répartition des couples Matières / Établissements :
+
+
+```{r , echo =F, fig.width=8, fig.height=6}
+mut_Graph = mut
+
+#mise en forme des données pour obtenir les couples établissement / matières (spread les matières, préparer les data dans le format pour GGplot)
+mut_Graph$ct = 1
+mut_Graph$id = 1:NROW(mut_Graph)
+
+mut_Graph = mut_Graph %>% spread(key = Matiere, value = ct)
+
+#sélectionner seulement les matières après spread
+mut_Graph  = mut_Graph[-c(2:23)]
+mut_Graph[is.na(mut_Graph)] = 0
+
+
+mut_Graph =mut_Graph %>% group_by(code_etablissement) %>% summarise_all(sum)
+
+
+mut_Graph$code_etablissement = 1:NROW(mut_Graph)
+
+#generate graph data
+{
+  df_2dgraph = data.frame(
+    x = rep(0,107*36),
+    y = rep(0,107*36)) 
+
+count = 1
+for (x in  1:107){
+    for (y in 2:36) {
+      if (mut_Graph[x,y] > 0) {
+        for (nb in 1:as.numeric((mut_Graph[x,y]))) {
+          df_2dgraph$x[count]=x
+          df_2dgraph$y[count]=y-.5
+          count = count +1
+                                                    }
+
+                            }
+                  }
+                }
+}
+#plot data
+ggplot((df_2dgraph %>% filter(x!=0)), aes(x=x, y=y) ) +
+  geom_bin2d(binwidth = c(1, 1)) +
+  theme_classic()+
+  scale_y_continuous(breaks = 1:36 + .5,
+                     labels = c(colnames(mut_Graph)[2:NCOL(mut_Graph)],""))+
+  theme(panel.grid.major.y = element_line(colour = "black"),
+        panel.grid.major.x = element_line(colour = "grey")
+  )+
+  xlab(label = "ID Etablissement")+
+  ylab(label = "")+
+  labs(title = "Représentation des couples Matières / Etablissements")
+```
+
+On constate les éléments suivants qui seront ensuite approfondis par la suite:
+
+* Tous d'abord la présence de doublons dans les données est mise en évidence, car chaque couple devrait être unique, ce qui n'est pas le cas pour les matières `ALLEMAND` et `LETT CLASS`. 
+
+* Les différentes matières sont représentées de façon assez déséquilibrée: certaine une seule fois, d'autres présents pour plus de la moitié des établissements
+
+* Globalement les données qui auraient pu être exhaustives dans tous les lycées pour les matières du tronc commun sont très éparses. La statistique Bayésienne bien adaptée à ce type de données.
+
+
+**Traitement des doublons**
+
+6 doublons ont été trouvés dans le dataset :
+
+```{r }
+#mut[c(14,16,60,61,393,395,409,413,446,450,459,461),]
+kable(mut[c(14,16,60,61,393,395,409,413,446,450,459,461),1:6])
+mut_nodup = mut %>% distinct()
+```
+
+Pour la suite de l'étude, nous avons supprimé les doublons, car ils auraient apporté une pondération erronée aux couples concernés. Notre analyse porte donc sur 510 couples matières / établissement.
+
+## 0.2 - Distibution des variables
+
+Tous d'abord la corrélation entre les variables est illustrée dans la figure suivante:
+
+
+```{r, fig.width=8, fig.height=6, include =T }
+
+cormat <- round(cor(mut_nodup[,-c(1:5)]),2)
+
+  get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+
+upper_tri <- get_upper_tri(cormat)
+
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab",
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+```
+
+Les variables sont globalement toutes très corrélées entre elles, en effet:
+
+* Les effectifs des classes supérieures des établissements sont naturellement influencés par les effectifs des classes inférieurs
+* Les taux de réussites dans une section sont représentatifs du niveau général d'un établissement et forcement assez semblable aux taux de réussite des autres sections
+
+La figure ci-après illustre les distributions des données du nombre de matière par établissement et vice versa.
+
+
+```{r  ,fig.width=8, fig.height=5}
+#distribution du nombre de matieres par établissement
+g1 = mut_nodup %>% group_by(code_etablissement) %>% summarise(nb = n())
+p1 = qplot(x = 1, y = nb, data = g1, xlab = "", geom = 'boxplot') + 
+  coord_flip()+
+  ylab("Nombre de matières")+
+  theme_bw()+
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        plot.title = element_text(size = 8))
+
+p2 = qplot(x = nb, data = g1, geom = 'histogram',
+           binwidth =1 )+
+  ylab( "Nombre d'établissements") +
+  theme_bw()+
+  theme(
+    axis.title.x = element_blank()
+  )+
+  labs(title = "Distribution du nombre de matières par établissement")+
+  theme(plot.title = element_text(size = 10))
+
+out1 = ggarrange(p2, p1, heights = c(2, 1), align = "hv", ncol = 1, nrow = 2)
+
+#distribution du nombre d'établissement par matières
+g2 = mut_nodup %>% group_by(Matiere) %>% summarise(nb = n())
+p1 = qplot(x = 1, y = nb, data = g2, xlab = "", geom = 'boxplot') + 
+  coord_flip()+
+  ylab("Nombre d'établissements")+
+  theme_bw()+
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+p2 = qplot(x = nb, data = g2, geom = 'histogram',
+           binwidth =2 )+
+  ylab( "Nombre de matières") +
+  theme_bw()+
+  theme(
+    axis.title.x = element_blank()
+  )+
+  labs(title = "Distribution d'établissement pour chaques matières")+
+  theme(plot.title = element_text(size = 10))
+
+out2 = ggarrange(p2, p1, heights = c(2, 1), align = "hv", ncol = 1, nrow = 2)
+ggarrange(out1, out2, heights = c(1, 1), ncol = 2, nrow = 1)
+
+
+
+```
+
+Ainsi on comprend que:
+
+* En moyennes les données renseignent 4 matières par établissement, 75% des établissements ont entre 3 et 6 matières et 2 établissements avec 10 ou plus matières
+
+* En moyennes les données matières sont présentes pour 12 établissement différents, 75% des matières sont présente dans 4 à 20 établissements et quelques matières comme l'anglais, les mathématique et l'histoire géographie sont disponible pour 40 à 60 établissements.
+
+
+```{r ,fig.width=10, fig.height=8}
+#boxplot
+par(mfrow = c(4,4))
+par(mar = rep(2,4))
+for (i in c(6:18)) {
+  boxplot(mut[,i], main=colnames(mut[i]), col=c("azure4","cornflowerblue"))
+        
+}
+
+#histogramme
+
+par(mfrow = c(4,4))
+par(mar = rep(2,4))
+for (i in c(6:18)) {
+  hist(mut[,i], main=colnames(mut[i]), col=c("cornflowerblue"))
+  
+}
+```
+
+Les distributions des variables caractérisant les établissements (sauf `Barre`) sont globalement centrées autour d'une valeur moyenne, les variables représentant des taux de réussites (donc max 100) sont faussées vers la gauche. On constate également la présence d'individus sur les queues de distributions.
+
+La variable `Barre` est analysée avec plus de détails dans les figures suivantes. Les Matieres présentes dans 1 seul établissement ou établissement avec une seule matière ne sont pas représentées.
+
+
+```{r ,fig.width=12, fig.height=10}
+ggplot(mut_nodup, aes(Barre, colour = Matiere)) +
+  geom_density() +
+  facet_wrap(~Matiere)+
+  labs( title = "Distribution de Barre en fonction des Matières")
+```
+
+On retrouve visuellement une distribution qui ressemble à l'histogramme de `Barre` (pic entre 0 et 500 et quelques individus après 1500) avec cette fois plus d'information sur l'influence des `Matiere `.
+
+Globalement la `Barre` par `Matiere` se situe entre 0 et 500, pour certaines matières le pic est plus étroit et proche de 0 (eg: biotechnol), pour d'autres on constate la présence d'un 2e pic pour des valeurs hautes de `Barre` (eg: phy.chimie, eco.ge.ven, etc.) .
+
+Certaines `Matiere` (philo, italien) ont des distributions de `Barre` relativement plate.
+
+Ainsi on comprend que la matière en elle-même à une certaine influence sur les barres de mutations nécéssaire mais qu'il y a un autre facteur (distribution à plusieurs pics ou aucuns pic), l'établissement, responsable des différences de `Barre`
+
+
+```{r ,fig.width=8, fig.height=6}
+ggplot(mut_nodup, aes(Barre, colour = code_etablissement)) +
+  geom_density() +
+  theme(legend.position="none")+
+  labs( title = "Distribution de Barre en fonction du code Etablissement")
+
+```
+
+Nous n'avons pas séparé les établissements, car certains ont très peu de matières et donc cela ne permet pas de conclure sur l'influence de la matière ou de l'établissement. Globalement les nombreux pics par établissement (représentés avec des couleurs différentes) renseignent d'une certaine influence des établissements sur la `Barre`.
+
+
+# 1 - Régression linéaire
+
+## 1.0 - modèle linéaire gaussien
+
+Avant d'effectuer la régression linéaire bayésienne, nous effectuons une régression linéaire standard pour expliquer la variable `Barre` :
+
+* La régression est faite sur toutes les variables numériques
+* Les variables `Matiere` et `code_etablissement` sont testés dans la régression, les autres variables sont redondantes ou n'apporte pas d'informations à ce stade.
+
+
+```{r , echo=F , include=F}
+mutc = mut_nodup[,-c(2:4)]
+summary(lm(Barre~., data = mutc ))
+summary(lm(Barre~. -code_etablissement, data = mutc ))
+summary(lm(Barre~. -Matiere, data = mutc )) 
+summary(lm(Barre~. -Matiere -code_etablissement, data = mutc ))
+summary(lm(Barre~ Matiere, data = mutc )) 
+```
+
+Cette première approche nous permet de voir que:
+
+* Les modèles incluant  `code_etablissement` ne convergent pas pour les variables numériques. Ce qui est normal, car toutes les variables numériques renseignent de paramètres d'effectif et de réussite propre à chaque établissement et donc complètement corrélés (toutes égales pour chaque établissement)
+* Cependant certaines classes de `code_etablissement` (certains établissements) ont des p-valeur significatifs:
+    + Lorsque la régression est effectuée seulement sur `code_etablissement` : environ 10% des établissements ont une influence significative sur la variable réponse et certaine avec une p-valeur inférieur à 0.001.
+    + Lorsque la régression est effectuée sur `code_etablissement` et `Matiere` les p-valeur significatifs des établissements sont globalement moins nombreux et moins élevés
+
+* Le modèle avec la variable `Matiere` converge sur les variables numériques, en effet les matières sont présentes une fois par établissement et dans plusieurs établissements et donc cela résout les problèmes de corrélation.
+    + Le modèle avec seulement la variable `Matiere` faut ressortir que plusieurs matières ont un impact significatif sur la variable réponse. L'intercepté est également très significative
+*  Dans le modèle avec les variables numériques en plus, le type de matière est moins un peu souvent significatif, mais reste globalement plutôt similaire. Le modèle avec seulement les variables numérique cherche donc à expliquer la variable réponse uniquement avec les caractéristiques des établissements. Seulement 4 variables sont un peu significatives (p-valeur entre 5 et 10%).
+    + On comprend bien qu'étant donnée l'influence de certaines matières sur la variable réponse, une régression seulement sur les caractéristiques numériques des établissements ne permet pas d'obtenir de modèle satisfaisant. La variabilité de `Barre` est trop importante entre les matières. 
+    + Cela se vérifie dans les scores Adjusted R-squared proche pour le modèle avec `Matiere` seulement (0.1477) et le modèle avec `Matiere` et variables numériques (0.1574); le modèle avec variable numérique seulement est bien plus mauvais (0.004397).
+
+
+Pour la suite on commencera donc à l'intéresser à la distribution de l'estimateur de la variable `Barre` grâce à la statistique Bayésienne. Dans un premier temps de façon générale, seulement grâce aux variables numériques afin d'obtenir plus d'information sur la dispersion de la variable lorsque l'ont le considère pas de matières ou établissement en particulier. Ensuite sur certaines matières en particulier afin de mieux comprendre les subtilités et l'influence des covaraibles numérique.
+
+
+## 1.1 Régression linéaire bayésienne
+
+### 1.1.1 Approche par prior de Zelnner et échantillonnage de Gibbs
+
+On souhaite réaliser la régression linéaire dans le cadre bayésien, pour cela une première approche peu être effectué selon la méthodologie suivante:
+
+#### choix de la prior
+
+* Les données à notre disposition et notre connaissance de la variable barre ne nous permettent pas d'inférer sur la "vrai" loi suivie pour calculer l'attractivité. À nous donc de faire un choix éclairé de la prior.
+* Il n'y a donc pas de raison spécifique de choisir une loi conjuguée particulière pour notre prior.
+
+Ainsi nous faisons le choix ici d'une prior non informative pour limiter l'impact de l'inférence initiale sur la prior. La prior de Zelnner est bien adapté à cette situation et pour la régression linéaire.
+
+#### Description de l'algorithme de sélection de variables MCMC avec échantillonnage de Gibbs
+
+* On tire au sort un vecteur binaire $\gamma$ pour décider quelles covariables inclure dans le modèle
+* Pour chaque composante $\gamma_{i}$ on calcule la vraisemblance du modèle (avec ou sans la covariable $i$)
+    + La fonction `marglkd1` est utilisée calcul la log-vraisemblance marginale pour deux modèles (l'intercepte est toujours gardé dans le modèle)
+    + On tire au sort la nouvelle composante composantes $\gamma_{j}$ selon une loi de Bernouilli donc la probabilité corresponds au ratio des vraisemblances marginales des modèles testés
+
+* Le nouveau modèle et sa vraisemblance sont calculés et sauvegardés
+* L'opération est répétée assez de fois pour que l'hypothèse de stationnarité de la chaine de Markov nous permette d'atteindre la convergence.
+* le choix du paramètre $g$ est fixé à $g = n = 510$ (on donne le même poids à la loi a priori qu'à une observation)
+
+
+L'algorithme a été testé plusieurs fois avec 10000 itérations et une fois avec 100000 itérations, les résultats sont stables et comparables. À noter que nous avons 2^17 = 131072 combinaisons différentes pour le vecteur $\gamma$.
+
+
+```{r , echo=FALSE}
+y = mut_nodup$Barre
+X = as.matrix(mut_nodup[,-c(1:6)])
+X = cbind(1,X)
+n = NROW(X)
+
+# fonction pour calculer la log-vraisemblance marginale
+marglkd1 = function(gamma, X, g=n){
+  q=sum(gamma)
+  X1=X[,c(T,gamma)]
+  if(q==0){return(q/2*log(g+1) - n/2*log(t(y)%*%y))}
+  m = -q/2*log(g+1) -
+    n/2*log(t(y)%*%y - g/(g+1)* t(y)%*% X1 %*%
+              solve(t(X1)%*%X1) %*%t(X1)%*%y)
+  return(m)
+}
+
+#echantillonage de gibbs sur les modèles
+
+if(!Load_data){
+niter = 1e4 # nombre d'iterations
+gamma = matrix(F,nrow=niter,ncol=NCOL(X)-1)
+gamma0 = sample(c(T,F),size=NCOL(X)-1, replace=TRUE) #valeur initiale aléatoire
+lkd = rep(0,niter)
+modelnumber = rep(0,niter)
+
+oldgamma = gamma0
+system.time(
+for(i in 1:niter){
+  newgamma = oldgamma
+  for(j in 1:(NCOL(X)-1)){
+    g1 = newgamma; g1[j]=TRUE
+    g2 = newgamma; g2[j]=FALSE
+    ml1 = marglkd1(g1, X)
+    ml2 = marglkd1(g2, X)
+    p = c(ml1,ml2)-min(ml1,ml2)
+    # On souhaite tirer depuis une Bernoulli, avec probabilité de tirer TRUE égale à exp(p[1])/(exp(p[1])+exp(p[2])).
+    # C'est ce que fait la ligne suivante. Notons que la fonction sample() calcule la constante de normalisation.
+    newgamma[j] = sample(c(T,F), size=1, prob=exp(p)) 
+  }
+  gamma[i,] = newgamma
+  lkd[i] = marglkd1(newgamma, X )
+  modelnumber[i] = sum(newgamma*2^(0:(NCOL(X)-2)))
+  oldgamma = newgamma
+}
+)
+
+#sauvegarde du modèle:
+gamma_e4iter_m1 = gamma
+modelnumber_e4iter_m1 = modelnumber
+#save(gamma_e4iter_m1, file = "gamma_e4iter_m1")
+#save(modelnumber_e4iter_m1, file = "modelnumber_e4iter_m1")
+
+}
+
+if(Load_data){
+load(file = "gamma_e4iter_m1")
+load(file ="modelnumber_e4iter_m1")
+}
+
+```
+
+
+#### Verification de la convergence
+
+**Autocorrelation de la chaine des modèles**
+
+On vérifie tout d'abord la qualité du mélange de la chaine de Markov grâce l'autocorrélation de l'exploitation des modèles de 
+$\gamma$. 
+ 
+
+```{r , echo=FALSE, ,fig.width=10, fig.height=8}
+par(mar = rep(3,4))
+par(mfrow=c(5,4))
+for(i in 1:17) acf(as.numeric(gamma_e4iter_m1[,i]), main = colnames(mut_nodup)[i+6], cex.main = .7)
+```
+
+
+L'autocorrélation décroit presque instantanément ou très rapidement pour toutes les variables. La chaine de Markov ne met pas beaucoup d'itération pour explorer les lois sur les covariables.
+
+**Valeurs et distribution des $\gamma _{i}$**
+
+On peux également afficher la moyenne mobile (ici par blocs de 200) de la valeur des coefficients binaire de $\gamma$. C'est à dire le pourcentage moyen de fois que la chaine a sélectionné ces variables:
+
+
+```{r , echo=FALSE, ,fig.width=10, fig.height=8}
+moy1 = apply(gamma_e4iter_m1, 2, "mean")
+par(mar = rep(3,4))
+par(mfrow=c(5,4))
+for(i in 1:17){ plot(rollapply(gamma_e4iter_m1[,i], width=200, FUN=mean), type="l",  main = paste0("Moyenne = ",moy1[i] ))
+  lines(x=c(1,10000), y=c(moy1[i],moy1[i]), col = "red")
+}
+```
+
+Pour chaque variable le pourcentage de fois qu'elle a été incluse dans le modèle est représenté en rouge. On constate l'algorithme fonctionne bien et rapidement les différentes variables sont sélectionnées de façon relativement stable autour d'une valeur moyenne. 
+
+On peut également représenter la moyenne mobile des $ \gamma_{j} $ par leurs histogrammes.
+
+```{r , echo=FALSE,fig.width=10, fig.height=8}
+par(mar = rep(3,4))
+par(mfrow=c(5,4))
+for(i in 1:17) hist(rollapply(gamma_e4iter_m1[,i], width=200, FUN=mean), main = colnames(mut_nodup)[i+6])
+```
+
+On voit bien que certaines covariables sont plus vraisemblables que d'autres pour expliquer la variable réponse et qu'il existe également une certaine incertitude sur les modèles même si la chaine converge. Certaines distributions sont proches de 0 et permet de penser que le $\beta_{i}$ de ces covariables est probablement nul.
+
+**Récurences des modèles**
+
+L'algorithme MCMC va revenir de nombreuses fois sur les modèles les plus probables. On s'interroge ici sur le nombre de modèles différents explorés en fonction du nombre d'itérations. On enlève systématiquement les 2000 premières interactions de burnin :
+
+* En repérant 10 l'algorithme avec 10000 itérations le nombre de modèles différents après burnin est compris entre 800 et 860
+* Sur l'agrégation des 10 précédents : environ 2400 modèles différents 
+* En effectuant 100000 itérations environ 2600 modèles différents
+* Sur l'agrégation des 10 fois 10000 itérations et une fois 100000 itérations: environ 3400 modèles différents.
+
+Le nombre de modèles exploités par l'algorithme croit beaucoup plus lentement que le nombre d'intégration, ce qui implique bien la récurrence d'apparition des modèles les plus probables. La nature aléatoire faite cependant apparaitre des modèles unique pour chaque fois que l'on repete l'algorithme.
+
+
+```{r }
+
+if(Load_data){
+load(file = "gamma_e5iter_m1")
+load(file = "modelnumber_e5iter_m1")
+load(file = "ls_model1e4")
+}
+
+modsansburn = list()
+Mod_nbDisct = rep(0,10)
+
+for (i in 1:10) {
+   Mod_nbDisct[i] = as.data.frame(ls_model1e4[[i]][2000:NROW(ls_model1e4[[i]])]) %>% distinct() %>% summarise(nb = n())
+   modsansburn[[i]] = ls_model1e4[[i]][2000:NROW(ls_model1e4[[i]])] 
+}
+
+Mod_nbDisct
+
+join10iter =  unlist(modsansburn)
+  
+as.data.frame(join10iter) %>% distinct() %>% summarise(nb = n())
+
+as.data.frame(modelnumber_e5iter_m1) %>% distinct() %>% summarise(nb = n())
+
+as.data.frame(c(join10iter,modelnumber_e5iter_m1[2000:NROW(modelnumber_e5iter_m1)])) %>% distinct() %>% summarise(nb = n())
+```
+
+
+#### Meilleurs modèles
+
+On regarde la fréquence des modèles avec 2000 de burnin (qui ne sont pas comptés) pour 10000 et 100000 itérations.
+
+
+```{r , echo=FALSE}
+
+#tirage des best modeles
+burnin = 2000 # 2000 itérations de burn-in
+niter=10000
+gammab = modelnumber_e4iter_m1[(burnin+1):niter] 
+res = as.data.frame(table(gammab))
+odo = order(res$Freq, decreasing=T)[1:20]
+modcho = res$gammab[odo]
+probtop20_1e4iter = res$Freq[odo]/(niter-burnin)
+indices = match(modcho, modelnumber_e4iter_m1)
+
+cbind(probtop20_1e4iter , gamma_e4iter_m1[indices, ])
+
+#tirage des best modeles
+burnin = 2000 # 2000 itérations de burn-in
+niter=100000
+gammab = modelnumber_e5iter_m1[(burnin+1):niter] 
+res = as.data.frame(table(gammab))
+odo = order(res$Freq, decreasing=T)[1:20]
+modcho = res$gammab[odo]
+probtop20_1e5iter = res$Freq[odo]/(niter-burnin)
+indices = match(modcho, modelnumber_e5iter_m1)
+print("1e5 itérations:")
+cbind(probtop20_1e5iter, gamma_e5iter_m1[indices, ])
+
+```
+
+Tous d'abords la comparaison entre 10000 et 100000 itérations montre des résultats assez  similaires et valide les points précédents.
+
+* le meilleur modèle apparait avec une probabilité de 12% 
+* L'ordre des modèles entre 10000 et 100000 itérations est légèrement différent, par exemple le 4e plus probable avec 1e4 itérations est le 6e plus probable avec 100000 interaction.
+* Les 11 premiers modèles le plus probables ne font intervenir d'une seule covariables. 
+* Le premier modèle avec 2 covariable est le 12e avec une probabilité assez faible de 1,2%
+
+Pour s'assurer d'un bon rapport convergence / temps de calcul, on prendra 20000 itérations avec 4000 de burnin pour la suite de nos analyses
+
+
+#### Estimation des coefficients de $\beta$  
+
+Les coefficients de $\beta$ sont calculés en faisant des tirages aléatoires des modèles selon leurs probabilités. Les $\beta$ sont ensuite calculés usuelement par régression linéaire, grâce à la fonction  `lm`. Ainsi on obtient une distribution des $\beta$.
+
+
+```{r , echo=FALSE}
+
+if(Load_data){
+load(file = "gamma_2e4iter_m1")
+load(file = "modelnumber_2e4iter_m1")
+}
+
+
+#calcul des Beta des modeles -> gagner en te,mps de calcul: seuelement sur les modeles trouvés uniques apres burnin
+burnin = 4000
+niter = 20000
+gamma_b_unique = as.data.frame(cbind( gamma_2e4iter_m1[(burnin+1):niter,],modelnumber_2e4iter_m1[(burnin+1):niter]) )  %>% distinct()
+
+#glimpse(gamma_b_unique) #1500 modèles uniques
+
+#calcul des beta pour chaques modèles, 17 variable + intercept + model number = 19
+
+m_coefbeta = matrix(rep(0,19*NROW(gamma_b_unique)), ncol=19)
+
+#calcul des coef grace a la fonction lm (on aurai pu aussi directement calculer avec la formule d inversion de matrices)
+
+{
+  Xpred = as.matrix(mut_nodup[,-c(1:6)])
+for (i in 1:NROW(gamma_b_unique)) {
+  Xtemp =  gamma_b_unique[i,]  * c(1:17,0) #numéroter les colonnes des modeles (retirer le mod number)
+  Xtemp = Xtemp[Xtemp!=0]  #supression des 0
+  coeftmp = lm(y~Xpred[,Xtemp])  #fit seulement sur variables du modele
+  m_coefbeta[i,c(1,Xtemp+1)] = coeftmp$coefficients  # save les coef
+  m_coefbeta[i,19] = gamma_b_unique[i,18]  #numéro du modèle
+}
+}
+
+
+
+#remetre les proba sur les modèles
+
+modelnumber_2e4iter_m1_noburn = as.data.frame(modelnumber_2e4iter_m1[(burnin+1):niter])
+colnames(modelnumber_2e4iter_m1_noburn) = c("modnum")
+proba = modelnumber_2e4iter_m1_noburn %>% group_by(modnum) %>% summarise(ndisct = n()/NROW(modelnumber_2e4iter_m1_noburn))
+m_coefbeta = as.data.frame(m_coefbeta)
+colnames(m_coefbeta)[19] = c("modnum")
+m_coefbeta_prob = m_coefbeta %>% left_join(proba, by = "modnum")
+
+
+#tirage aléatore des Beta
+
+MCMC_Beta_sample = sample(1:NROW(m_coefbeta_prob), size = 1e4 , replace = T , prob = c(m_coefbeta_prob$ndisct) )
+
+MCMC_Beta = m_coefbeta_prob[MCMC_Beta_sample,]
+
+#Distribution des Beta
+
+moy2 = apply(gamma_2e4iter_m1[(burnin+1):niter,], 2, "mean")
+moy3 = c(1,moy2) 
+  
+
+
+```
+
+
+```{r , echo=FALSE,fig.width=8, fig.height=6}
+  par(mfrow = c(4,5))
+par(mar = rep(2,4))
+for (i in 1:18) {
+    hist(MCMC_Beta[which( MCMC_Beta[,i] != 0),i], main = paste0("(var",i-1,") ",moy3[i]) )
+  
+}
+
+```
+
+La figure ci-après illustre la distribution des $\beta$ et la probabilité  de tirage de chaque coefficient (l'intercepte est toujours incluse). On constate que:
+
+* De façon générale, les coefficients de $\beta$ qui sont issus de modèles avec de petites probabilités (moins de 10%) ont une distribution assez dispersée, sauf pour  $\beta_{10}$ et $\beta_{11}$
+* Les valeurs moyennes des coefficients ne sont pas vraiment informatives, car les coefficients de $\beta$ varient énormément selon le nombre de $\beta_{i}$ inclus dans les modèles. 
+* Selon le modèle choisi l'intercepte peut être négative ou positive et les $\beta_{i}$ également. Cependant lorsque l'un des $\beta_{i}$ est sélectionné avec une forte probabilité, comme pour $\beta_{15}$ qui est présent dans 29% des modèles, la distribution du coefficient est peu dispersée.
+
+À noter quand dans la procédure utilisée ici tous les modèles tirés au sort sont concernés. Cette procédure pourrait être améliorée et raffinée, par exemple, en calculant le facteur de Bayes à chaque tirage pour ne garder que les modèles le plus informatifs.
+
+Une implémentation basée sur ce principe est disponible dans le package `BAS`. Nous comparons les résultats calculés précédemment grâce à celui-ci dans la section suivante. 
+
+### 1.1.2 - Bayesian avec le package BAS
+
+#### Pour reproduire l'algorithme utilisé précédemment
+
+On utilise le package avec les paramètres suivants:
+
+* `method="MCMC"` : méthode similaire au MCMC précédent avec en plus une sélection des modèles pertinents grâce au facteur de Bayes (algorithme MC3)
+* `prior = "g-prior"` : prior de Zellner (comme précédemment)
+* on prend le même nombre d'itérations  (20000)
+
+La moyenne des $\gamma_{i}$ est comparé aux probabilités de sélection de chaque variable obtenue dans le package.
+
+
+```{r }
+X_no_intercept = X[,-1]
+
+modBAS_1 = bas.lm(Barre~. ,data = mut_nodup[,-c(1:5)],
+                prior = "g-prior",
+                method="MCMC",
+                MCMC.iterations=2e4,
+               # n.models = 2e4,
+                modelprior=uniform(),
+                alpha = n
+)
+
+#sum(moy3)
+#sum(modBAS_1$probne0)
+
+#Comparaison entre les selection de modèle de gamma et celles du package BAS
+comparre_prob = data.frame(
+  Prob_Dm_procedure = moy3,
+  Prob_Package_BAS = modBAS_1$probne0)
+
+#la somme des probabilité n'est pas la même, on regarde en renormalisant à 1 sur les varaibles (sans l'intercept)
+comparre_prob2 = data.frame(
+  Prob_Dm_procedure = moy3/(sum(moy3)-1),
+  Prob_Package_BAS = modBAS_1$probne0/(sum(modBAS_1$probne0)-1), 
+  VarID = 0:17)
+
+comparre_prob2$Prob_Dm_procedure[1] = 1
+comparre_prob2$Prob_Package_BAS[1] = 1
+
+dataGrf = gather(comparre_prob2,"Prob_Dm_procedure","Prob_Package_BAS", key = "Algorythme" , value = "prob") %>% filter(VarID!=0)
+
+ggplot(dataGrf , aes(x = Algorythme , y = prob )) +
+  geom_bar(stat='identity', aes(fill=Algorythme)) +
+  facet_grid(~VarID) +
+  theme(axis.text.x = element_blank()) +
+  xlab("# Variable") +
+  ylab("Probabilité de selection de la variable")
+
+```
+
+Les résultats pour la sélection de variables sont identiques entre le package et l'algorithme utilisé précédemment. Les petites variation dans les coefficients sont dues à la nature aléatoire de la chaine. 
+
+On compare maintenant avec la distribution des $\beta_{i}$
+
+
+```{r , echo=FALSE, ,fig.width=8, fig.height=6}
+coef.BAS = coef(modBAS_1)
+par(mfrow = c(4,5))
+par(mar = rep(2,4))
+plot(coef.BAS, subset = c(1:18), ask = F )
+
+```
+
+On constate clairement que la distribution des  $\beta_{i}$ et de l'intercepte est très différente des résultats obtenus avec notre algorithme. plusieurs explications sont possibles:
+
+* L'algorithme que nous avons construit est erroné, cause que nous espérons peu probable
+* Le package utilise une ou des étapes supplémentaires pour le calcul des  $\beta_{i}$. Notamment grâce à un calcul de facteur de Bayes. Cela nous semble être la cause explicative.
+
+De plus on constate qu'avec les paramètres utilisés, l'hypothèse nulle est la plus probable pour toutes les variables (sauf l'intercepté). Cela se voit grâce à la hauteur de la barre verticale en 0 qui est systématiquement supérieure au maximum des distributions des  $\beta_{i}$. Ainsi pour les questions suivantes, avant de comparer à l'analyse fréquente on souhaite trouver un modèle permettant de conserver au moins une variable. Pour cela on essayer par exemple:  de faire une sélection de variables, de rajouter les variables catégorielles ou de modifier les paramètres (prior, calculé de vraisemblance, etc.)
+
+## 1.2 Choix des covariables significatives et compare à une analyse fréquentiste
+
+### 1.2.1 Choix des covariables significatives
+
+#### Lasso / ridge
+
+Par validation croisée sur $\lambda$, la sélection de variables est effectuée, le paramètre `alpha` ne change pas les variables sélectionnées pour le $\lambda$ optimal.
+
+
+```{r , echo=FALSE,fig.width=8, fig.height=6}
+#determination du lambda optimal
+set.seed(11111)
+cv.elastnet <- cv.glmnet(X,y,
+                       nfolds=10 ,standardize=T, alpha = 1)
+#choix du alpha apres plusieurs essais, pas  d'influence -> lambda optimal conserve 3 variables
+plot(cv.elastnet)
+#coef(cv.elastnet, s = "lambda.min")
+#print(log(cv.elastnet$lambda.min))
+
+elastnet1 = glmnet(X,y,standardize=T,alpha = .8)
+
+vn=c("intercept", colnames(X)[-1])
+par(mar=c(4.5,4.5,1,9))
+plot(elastnet1)
+vnat=coef(elastnet1)
+vnat=vnat[-1,ncol(vnat)] # remove the intercept, and get the coefficients at the end of the path
+axis(4, at=vnat,line=-.5,label=vn,las=1,tick=FALSE, cex.axis=0.6) 
+
+```
+
+Les variables sélectionnées en plus de l'intercepte sont:
+
+* `taux_brut_de_reussite_serie_es`
+* `taux_acces_attendu_seconde_bac`
+* `taux_acces_attendu_premiere_bac`
+
+On remarque que ces 3 variables étaient également celles avec la probabilité marginale d'inclusion la plus forte dans le modèle bayésien calculé précédemment.
+
+#### Bayesien sur les variables sélectionnées
+
+On constate que même avec moins de variables, l'intervalle de confiance des coefficients recouvre le 0 . La probabilité marginale d'inclusion des 3 variables (sauf l'intercepte) est plus faible que l'hypothèse nulle.
+Le modèle n'est toujours pas satisfaisant, on regarde si paramètres du package / lois utilisés ne peuvent pas être modifiés pour trouver un meilleur modèle.
+
+
+```{r , echo=FALSE ,fig.width=8, fig.height=6, message = FALSE}
+modBAS_2 = bas.lm(Barre~ taux_brut_de_reussite_serie_es + taux_acces_attendu_seconde_bac + taux_acces_attendu_premiere_bac,
+                data = mut_nodup[,-c(1:5)],
+                prior = "g-prior",
+                method="MCMC",
+                MCMC.iterations=2e4,
+                modelprior=uniform(),
+                alpha = n
+)
+
+coef.BAS2 = coef(modBAS_2)
+par(mfrow = c(3,2))
+par(mar = rep(2,4))
+plot(coef.BAS2, subset = c(1:4), ask = F )
+plot(confint(coef(modBAS_2), parm = c(2:4)),xaxt='n' )
+
+
+```
+
+
+#### Recherche d'un meilleur modèle sur les variables sélectionnées
+
+Paramètres utilisés:
+
+* `method="MCMC+BAS"` : méthode MC3 + échantillonnage préférentiel
+* `modelprior = beta.binomial(1,1)`, correspond à une loi uniforme discrète, on considère que chaque valeur de Barre à la même probabilité de réalisation, a prairie, mais avec un caractère plus discret, pouvant probablement se rapproche plus de ce qui est observé dans les données.
+* `prior = hyper-g-laplace` : pour calculer la vraisemblance 
+
+
+```{r , echo=FALSE,message = FALSE}
+modBAS_2 = bas.lm(Barre~  taux_brut_de_reussite_serie_es + taux_acces_attendu_seconde_bac + taux_acces_attendu_premiere_bac,
+                  data = mut_nodup[,-c(1:5)],
+                  prior = "hyper-g-laplace",
+                  method="MCMC+BAS",
+                  MCMC.iterations=2e4,
+                  modelprior=beta.binomial(1,1)
+)
+
+coef.BAS2 = coef(modBAS_2)
+par(mfrow = c(3,2))
+par(mar = rep(2,4))
+plot(coef.BAS2, subset = c(1:4), ask = F )
+plot(confint(coef(modBAS_2), parm = c(2:4)),xaxt='n' )
+
+```
+
+Bien que la probabilité postérieure des variables 2 et 3 est plus importante que l'hypothèse nulle, l'intervalle de confiance recouvre toujours le 0. De plus les coefficients de $\beta$ sont exactement les mêmes que ceux calculés au point précédent. Finalement on a juste changé la manière dont la vraisemblance est calculée pour arriver au même résultat. 
+
+### 1.2.2 - Comparaison avec le modèle fréquentiste
+
+On effectue une sélection de variables par la fonction step et le critère de l'AIC:
+
+* Lorsque l'ont inclus toutes les variables, le step sélection 3 variables: taux_acces_attendu_premiere_bac, taux_reussite_attendu_serie_l et Matiere
+* Lorsque l'on retire les variables catégorielles, seules taux_acces_attendu_premiere_bac et taux_reussite_attendu_serie_l sont concervés. En détail :
+
+
+```{r , include=FALSE ,echo=TRUE }
+mutc = mut_nodup[,-c(2:4)]
+#summary(lm(Barre~., data = mutc ))
+#mods1 = step(lm(Barre~. , data = mutc ), direction = "both" , quiet = T)
+#summary(mods1)
+mods2 = step(lm(Barre~. -Matiere, data = mutc ), direction = "both" , trace=0)
+summary(mods2)
+
+
+```
+ 
+Lorsque l'on regarde les coefficients, on constate que: 
+
+* L'intercepte est négative on pars donc d'une `Barre` négative, cependant le coefficient de `taux_acces_attendu_premiere_bac` est tellement importante que toutes les prédictions restent positives.
+
+* Le `coeficient de taux_reussite_attendu_serie_l` est négatif. Ce qui laisse penser que la `Barre` d'accès diminue losque l'établissement à un meilleur taux de réussite pour la section L. Cela parait étonnant, car ce sont généralement les établissements avec les meilleurs taux de réussite qui sont les plus convoités et donc ceux avec le Barre la plus haute.
+
+Finalement on constate que `taux_acces_attendu_premiere_bac` qui est la variable donc le coefficient et les plus vraisemblablement différents de 0 avec l'approche Bayésienne est également celui avec la p-value la plus faible (0.002) pour la sélection de variables du modèle linéaire avec le step et l'AIC.
+
+Afin de comparer les deux approches, on peut procéder à une validation croisée : 
+
+## 1.3 Analyse des mutations en mathématiques et en anglais
+
+Ces matières sont parmi celles les plus représentés dans le jeu de données avec respectivement 52 et 59 individus (établissements) pour l'Anglais et la Mathématiques. Parmi ceux-ci, 31 Matiere sont issues du même établissement.
+
+
+```{r , echo=FALSE, eval=FALSE}
+
+d1=  mut_nodup %>% filter(Matiere %in% c("MATHS")) 
+d2= mut_nodup %>% filter(Matiere %in% c("ANGLAIS")) 
+
+NROW(intersect(d1[,1],d2[,1]))
+```
+
+
+### 1.3.1 - Bayésien sur toutes les variables 
+
+On effectue de nouveau la régression Bayesienne, avec les paramètres optimisés, sur 2 jeux de données avec seulement les matières Anglais et Mathématiques. Tous d'abord, nous avons conservé toutes les variables. La figure suivante indique les coefficients ainsi que leurs intervalles de confiances. L'intercepte correspond à la variable 0 dans les figures suivantes.
+
+
+
+```{r , echo=FALSE,echo=FALSE,fig.width=11, fig.height=9}
+
+mut_AN =  mut_nodup[,-c(1:4)] %>% filter(Matiere == "ANGLAIS")
+mut_AN = mut_AN[,-1]
+
+modBAS_Ang = bas.lm(Barre~.  ,
+                  data =mut_AN,
+                prior = "g-prior",
+                method="MCMC",
+                MCMC.iterations=2e4,
+                modelprior=uniform(),
+                alpha = n
+)
+
+mut_MA =  mut_nodup[,-c(1:4)] %>% filter(Matiere == "MATHS")
+mut_MA = mut_MA[,-1]
+
+modBAS_Ma = bas.lm(Barre~.,
+                    data = mut_MA,
+                prior = "g-prior",
+                method="MCMC",
+                MCMC.iterations=2e4,
+                modelprior=uniform(),
+                alpha = n
+)
+
+coefMA = coef(modBAS_Ma)
+coefAN = coef(modBAS_Ang)
+
+df_graphcoef = data.frame(
+  Beta = c(coefMA$postmean,coefAN$postmean ),
+  SD = c(coefMA$postsd,coefAN$postsd ),
+  Matiere = c(rep("Math", NROW(coefMA$postmean)), rep("Anglais", NROW(coefAN$postmean))),
+  VarID = c(0:17,0:17)
+)
+
+
+
+ggplot(df_graphcoef 
+       , aes(x= "", y=Beta, fill=Matiere)) + 
+  geom_bar(position=position_dodge(), stat="identity",colour="black") +
+  geom_errorbar(aes(ymin=Beta-SD, ymax=Beta+SD),
+                width=.2,                    
+                position=position_dodge(.9))+
+  theme_bw()+
+  facet_wrap(~VarID, scales = "free")+
+  theme(strip.text = element_text(size = 7))
+
+  
+
+
+```
+
+
+En comparant les coefficients trouvés, on constate que:
+
+* Certaines variables ont des coefficients relativement proches avec des valeurs proches et le même signe
+* Certaines variables sont du même signe, mais avec des valeurs de coefficients assez éloignés
+* Certaines variables ont des coefficients de signes opposés 
+
+Les intervalles de confiances ne sont pas commentés, car forcément globalement plus petit pour la matière avec le plus d'individus (Mathématiques)
+
+Ainsi on peut conclure que les covariables agissent de manière différente pour ces deux disciplines. Surtout pour les variables avec des coefficients de signes opposés.
+
+Le détail des variables et modèles les plus fréquents est illustré ci-dessous.
+
+
+```{r , echo=FALSE, include=F}
+image(modBAS_Ang, rotate = F , main = "Anglais")
+image(modBAS_Ma, rotate = F, main = "Mathématiques")
+```
+
+On constate que les modèles et variables les plus fréquents sont très différents selon la matière.
+
+
+### 1.3.2 - Bayésien sur les variables sélectionnées précédemment
+
+On recommence l'analyse avec un nombre de variables réduites. Pour cela on réutilise les variables sélectionnées par le lasso sur le jeu de données complet effectué précédemment.
+
+
+```{r , echo=FALSE, include=F}
+
+modBAS_Ang = bas.lm(Barre~taux_brut_de_reussite_serie_es + taux_acces_attendu_seconde_bac + taux_acces_attendu_premiere_bac  ,
+                  data =mut_AN,
+                prior = "g-prior",
+                method="MCMC",
+                MCMC.iterations=2e4,
+                modelprior=uniform(),
+                alpha = n
+)
+
+
+modBAS_Ma = bas.lm(Barre~taux_brut_de_reussite_serie_es + taux_acces_attendu_seconde_bac + taux_acces_attendu_premiere_bac ,
+                    data = mut_MA,
+                prior = "g-prior",
+                method="MCMC",
+                MCMC.iterations=2e4,
+                modelprior=uniform(),
+                alpha = n
+)
+
+coefMA = coef(modBAS_Ma)
+coefAN = coef(modBAS_Ang)
+
+df_graphcoef = data.frame(
+  mean_Beta = c(coefMA$postmean,coefAN$postmean ),
+  SD = c(coefMA$postsd,coefAN$postsd ),
+  Matiere = c(rep("Math", NROW(coefMA$postmean)), rep("Anglais", NROW(coefAN$postmean))),
+  VarID = rep(c(0,6,13,15),2)
+)
+
+ggplot(df_graphcoef %>% filter(VarID !=-1)
+       , aes(x="", y=mean_Beta, fill=Matiere)) + 
+  geom_bar(position=position_dodge(), stat="identity",colour="black") +
+  geom_errorbar(aes(ymin=mean_Beta-SD, ymax=mean_Beta+SD),
+                width=.2,                    
+                position=position_dodge(.9))+
+  theme_bw()+
+  facet_wrap(~VarID, scales = "free")
+  
+
+```
+
+On constate que lorsque l'on se place dans un modèle plus simple avec seuelement 3 variables + l'intercepte:
+
+* Les coéficients n'ont pas tous le même signe
+* les valeur des coéficients sont relativement diférentes
+
+De plus, dans les figures suivante, on constate que les modèles choisie sont encore une fois différents :
+
+* Les deux premiers modèles les plus probables pour les mathématiques font intervenir l'intercepte et une variables
+* le Modèles le plus probable pour l'anglais n'as que l'intercepte.
+
+```{r , echo=FALSE, include=F}
+image(modBAS_Ang, rotate = F , main = "Anglais")
+image(modBAS_Ma, rotate = F, main = "Mathématiques")
+```
+
+Au vu des constatations des points précédents, on conclut que les covariables agissement de manières différentes pour ces deux disciplinent.
+
+
+# 2 - Loi de Pareto
+
+## 2.4 - Réalisation d'une loi de Pareto et impact du paramètre $\alpha$
+
+On utilise le package `VGAM` pour tirer les réalisations de loi de Pareto dont la densité s'écrit:
+
+
+$$
+f_{Z}(z;m;\alpha)=\alpha\frac{m^{\alpha}}{z^{\alpha+1}}\mathbb{I}_{\{z\geq m\}}
+$$
+
+La figure suivante illustre la densité de ces tirages pour plusieurs valeurs de $\alpha$ variant entre 0.8 et 10 et $m=1$.
+
+```{r , echo=FALSE}
+alpha = c(0.8,1,2,5,8,10)
+m = 1
+n = 5e4
+
+ls_pareto = list()
+ls_alpha  = list()
+
+for (i in 1:NROW(alpha)) {
+  ls_pareto[[i]] = rpareto(n, scale = m, shape = alpha[i] )
+  ls_alpha[[i]] = rep(alpha[i],n)
+  }
+
+df_pareto = data.frame(
+  tirage = unlist(ls_pareto),
+  alpha = unlist(ls_alpha)
+)
+
+df_pareto$tiragecentr = df_pareto$tirage-df_pareto$alpha
+df_pareto$alpha = as.factor(df_pareto$alpha)
+
+ggplot(df_pareto, aes(x=tirage, color = alpha)) +
+  geom_density() +
+  labs( title = "Densité de la réalisation d'un loi de Pareto pour plusieurs alpha")+
+  xlim(0,3)+
+  xlab("x")
+
+
+```
+
+On relève principalement deux impactes du paramètre $\alpha$:
+
+* Conformément à la formule de la densité, la valeur de $\alpha$ qui représente la forme de la distribution resserrée la distribution pour des valeurs élèves
+* Pour $\alpha$ est petit et proche de 0, plus la densité est étalée: a queue de distribution est plus lourde, la densité s'aplatit et le maximum de densité se déplace vers la droite.
+* Lorsque $\alpha$ est très grand les valeurs des tirages sont très proches de $0$ la densité tends vers l'infini. Cela se rapproche d'une fonction de Dirac
+
+
+Afin de mieux comprendre le comportement on trace la fonction de répartition pour les différents $\alpha$ :
+
+
+```{r , echo=FALSE}
+ggplot(df_pareto, aes(x=tirage, color = alpha)) +
+  stat_ecdf(geom = "step")+
+  labs( title = "Fonction de répartition des tirage Pareto pour plusieurs alpha")+
+  xlim(c(0,5))+
+  xlab("x")
+```
+
+On voit bien la convergence plus rapide de la distribution cumulative pour une loi de Pareto lorsque $\alpha$ est grand, et inversement pour $\alpha$ petit.
+
+
+## 2.5 & 2.6 - Choix de loi à priori et calcul des posteriors
+
+### Inférence sur la borne supérieure de Barre
+
+Plusieurs choix s'offrent à nous quant à l'interprétation de cette question et de comment utiliser la croyance initiale que la  variable aléatoire Barre ($n=510$, le nombre de données de Barre) suit une loi de Pareto de paramètre $\alpha,m >0$ et de densité : 
+
+
+$$
+f_{Z}(z;m;\alpha)=\alpha\frac{m^{\alpha}}{z^{\alpha+1}}\mathbb{I}_{z\geq m}
+$$
+
+La loi uniforme peut s'appliquer sur les données et intervient sur notre croyance du modèle des données pour calculer la borne maximale de Barre. Dans ce cas on choisit comme prior une loi de Pareto et suppose que les valeurs de barre ($>0$) sont réparties de façon uniforme. 
+Prior Pareto:
+
+$$
+\pi(w)=\alpha\frac{m^{\alpha}}{w^{\alpha+1}}
+$$
+Vraisemblance : loi uniforme avec $w > max(z_i)$  pour couvrir le jeu de données
+
+$$
+l(w|z)\propto\frac{1}{w^n}, w > max(z_i)
+$$
+Ce qui donne une postérieur :
+$$
+\pi(w|z)\propto\frac{(\alpha+n).max(m,z_i)^{\alpha+n}}{w^{\alpha+n+1}}
+$$
+De cette façon et avec les paramètres $\alpha,m$ de connus on peut inférer sur une valeur maximale de Barre. Ce qui peut être utile pour prévoir sa mutation professionnelle !
+
+### Inférence sur le paramètre $m$
+
+$m$ est le paramètre de localisation de la distribution, il régit la position de la densité de probabilité. on voit bien cela directement dans la formule de la densité avec $\mathbb{I}_{z\geq m}$.
+
+Dans les calculs suivants on utilise $M=1/m$ qui est le paramètre de précision.
+
+Dans le cas ou $\alpha$ serait connus et $M$ inconnu on peut utiliser un modèle de données suivant une loi inverse Pareto (fonction puissance) et  une Prior de Pareto de paramètres $(a,b)$. 
+
+Prior Pareto:
+
+$$
+\pi(M)=a\frac{b^{\alpha. a}}{M^{a+1}}, M > b
+$$
+Vraisemblance :
+$$
+l(M|z)\propto\ M^{\alpha.n}, M<min(z_i)
+$$
+Ce qui donne une postérieure:
+
+$$
+\pi(M|z)\propto\frac{(a-\alpha n).b^{(a-\alpha n)\alpha}}{M^{a-\alpha n+1}}; a>\alpha n , M>b
+$$
+On retrouve une loi de conjugué de Pareto. Cette approche peut être utilisée pour inférer, par exemple, sur la localisation du minimum de la distribution de Barre, notamment si l'ont se place pour une matière particulière. 
+
+### Inférence sur le paramètre $\alpha$
+
+Finalement paramètre de forme $\alpha$ qui décrit la dispersion de la loi de Pareto peu être estimé à l'aide en se plaçant dans un cas particulier d'un modèle exponentiel. En effet, si $Z$ suit une distribution de Pareto, alors $Y = log(X/{m})$ suit une distribution exponentielle. On à bien $\lambda > 0$, car $\alpha > 0$. Dans se cas mieux connus nous pouvons utiliser la loi conjuguée Gamma de paramètre $(a,b)$ en prior.
+
+Note: on fait me choix de se placer dans le cas d'une loi gamma $\Gamma (a,b)$ aussi noté $\Gamma (k,\theta)$, car le paramètre $\theta$ représente l'échelle pour la loi de Pareto alors que dans $\Gamma (\alpha,\beta)$, $\beta$ représente un paramètre de taux ($\beta = 1/\theta$).
+
+Prior $\Gamma (a,b)$:
+
+$$
+\pi(\alpha)=\frac{\alpha^{a-1} e^{-\alpha/b}}{b^{a} \Gamma(a)}, \alpha > 0
+$$
+
+Vraisemblance :
+
+$$
+\begin{aligned}
+l(\alpha|z)&\propto \prod_{i=1}^{n}\alpha\frac{m^{\alpha}}{(z_{i})^{\alpha+1}}\\
+&\propto \frac {\alpha^n m^{n \alpha}}{(\prod_{i=1}^{n} z_i)^{\alpha+1}}
+\end{aligned}
+$$
+
+Ce qui donne une postérieure :
+
+$$
+\begin{aligned}
+\pi(\alpha|z) &\propto \pi(\alpha) . l(\alpha|z)\\
+&\propto \frac {\alpha^{a+n+1}e^{-\alpha/b'}}{b'^{a+n}\Gamma(a+n)},\\
+&b' = \frac{1}{\frac{1}{b}+log (\prod_{i=1}^{n} z_i))-n log (m)} >0
+\end{aligned}
+$$
+
+De plus $b'>0$ car $log -(\prod_{i=1}^{n} z_i)-n log (m) = 2682-1576 >0$ pour $m=21$. Dans la littérature on retrouve la notation $x_m$ comme étant le minimum sur les données et qui est égal à $m$ dans la notation du devoir. Avec cette approche on peut donc penser que le calcul de la portérior fonctionne encore pour des $m$ plus grand. Il serait intéressant de se servir de l'approche détaillée précédemment pour estimer le paramètre $m$ et voir si l'ont retrouve une valeur plus grande, qui annulerait peut-être $log (\prod_{i=1}^{n} z_i))-n log (m)$
+
+
+Finalement on revient à prendre une loi à postériori plus facile à implémenter, si $\pi(\alpha) = \Gamma(a,b)$, avec $b$ implémenté comme un paramètre d'échelle, nous trouvons le postérieur suivante:
+
+$$
+\pi(\alpha|z) \propto \Gamma(a + n , b + \sum_{i=1}^{n}ln \frac{z_i}{m} )
+$$
+
+Ce qui donne une logpostérior:
+
+$$
+(a + n) .log (b + \sum_{i=1}^{n}ln \frac{z_i}{m})+(a + n-1).log(z_i)-[b + \sum_{i=1}^{n}ln \frac{z_i}{m}].z_i-\Gamma(a+n)
+$$
+
+## 2.7 - Tirage de la loi à postériori
+
+Nous simulons la loi à postériorie à l'aide de l'algorithme de Metropolis-Hastings.
+Pour l'exploration de la chaine on choisi une loi de proposition normal $\mathcal{N}(\alpha_{t},\tau^2)$ avec $\tau$ la variance de la proposition qui permet de contrôler la vitesse l'exploitation de la loi.
+
+Tous d'abord nous cherchons à optimiser le paramètre $ \tau$. On choisie une loi à prairie de $\Gamma(1,1)$ et $\alpha_0 = 0.1$ pour l'initialisation.
+
+
+```{r }
+
+m=21
+a=1
+b=1
+
+#Log Posterior
+logposterior = function(alpha, y,m=m,a=a,b=b){
+  n=length(y)
+  logposterior = (a + n)*log(b+sum(log(y/m)))+(a+n-1)*log(alpha)-(b+sum(log(y/m)))*alpha-rgamma(n=1,shape = a+n)
+  if(!is.finite(logposterior)) return(-Inf)
+  #print("ok")
+  return(logposterior)
+}
+
+require(mvtnorm)
+MH = function(alpha0, y,niter, tau){
+  alpha = rep(NA, nrow=niter)
+  alpha[1] = alpha0
+  acc = 0 # nombre d'acceptations
+  
+  for(i in 2:niter){
+    proposal = rnorm(1, alpha[i-1], tau)
+    logalpha = logposterior(proposal, y, m,a,b)-logposterior(alpha[i-1], y, m,a,b)
+ 
+    
+    if(log(runif(1)) < logalpha){
+      alpha[i] = proposal
+      acc = acc + 1
+    }
+    else{
+      alpha[i] = alpha[i-1]
+    }
+  }
+  cat("---Proportions d'acceptation pour tau=",tau,"\n")
+  print(acc/niter) #proportion d'acceptations
+  return(alpha)
+}
+
+```
+
+Nous analysons la proportion d'acceptation de l'algorithme pour différentes valeurs de $\tau = (0.01,0.5,0.1,0.275)$.
+On choisit de faire 20000 itérations afin d'être certain de bien avoir exploré tous les modes de la loi.
+
+```{r, warning=FALSE}
+
+niter = 2e4
+cat("--------------------------------Proportions d'acceptations----------------------------------\n")
+alpha1 = MH(alpha0=0.1, y,niter, tau=0.01)
+alpha2 = MH(alpha0=0.1, y,niter, tau=0.1)
+alpha3 = MH(alpha0=0.1, y,niter, tau=3)
+alpha4 = MH(alpha0=0.1, y,niter, tau=0.275)
+```
+
+Pour $\tau = 0.275$ on la proportion d'acceptation est proche de l'ordre de 23%, ce qu est proche de l'optimum trouvé par Robert, Gelman & Gilks (1997) dans un cas plus simple et également une bonne vitesse de mélange qui permet d'explorer correctement la loi.
+
+Graphique nous regardons (après 1000 itérations de burnin) le tracé de chaine , l'autocorrélation et la distribution des valeurs de $\alpha$.
+
+```{r ,fig.width=10,fig.height=8}
+# Sortie de l'algorithme pour differentes valeurs de tau
+par(mfcol=c(4,3))
+# trace
+plot(alpha1, type="l",ylab=expression(alpha),xlab="")
+plot(alpha2, type="l",ylab=expression(alpha),xlab="")
+plot(alpha3, type="l",ylab=expression(alpha),xlab="")
+plot(alpha4, type="l",ylab=expression(alpha),xlab="")
+
+# autocorrélations
+acf(alpha1[1000:niter],xlab="",main=expression(tau==0.01))
+acf(alpha2[1000:niter],xlab="",main=expression(tau==0.1))
+acf(alpha3[1000:niter],xlab="",main=expression(tau==3))
+acf(alpha4[1000:niter],xlab="",main=expression(tau==0.27))
+
+# histogrammes
+hist(alpha1[1000:niter], breaks=30,xlab="",main=expression(paste(alpha,",",tau,"=0.01")))
+hist(alpha2[1000:niter], breaks=30,xlab="",main=expression(paste(alpha,",",tau,"=0.1")))
+hist(alpha3[1000:niter], breaks=30,xlab="",main=expression(paste(alpha,",",tau,"=3")))
+hist(alpha4[1000:niter], breaks=30,xlab="",main=expression(paste(alpha,",",tau,"=0.27")))
+
+cat("--------------------------------Tailles d'échantillons effectives ESS----------------------------------\n")
+cat("ESS Tau=0.01\n",niter/(2*sum(acf(alpha1[1000:niter], plot=F)$acf) - 1),"\n")
+cat("ESS Tau=0.1\n",niter/(2*sum(acf(alpha2[1000:niter], plot=F)$acf) - 1),"\n")
+cat("ESS Tau=3\n",niter/(2*sum(acf(alpha3[1000:niter], plot=F)$acf) - 1),"\n")
+cat("ESS Tau=0.275\n",niter/(2*sum(acf(alpha4[1000:niter], plot=F)$acf) - 1),"\n")
+
+```
+
+* Pour $\tau = 0.01$ : la variance de la proposition est trop faible, la chaine met trop de temps à explorer la loi et l'autocorrélation décroît très lentement
+* Pour $\tau = 0.1$ :  la proportion d'acceptation est de 40% sont seulement 10% de moins que pour le $\tau précédent. Cependant l'autocorrélation décroit rapidement et la trace de la chaine explore bien la loi
+* Pour $\tau = 3$ : seulement 3% des propositions sont acceptés. Graphiquement :la chaine reste bloquée à la même valeur de nombreuses fois, l'autocorrélation décroit lentement et l'histogramme des valeurs est de moins bonne qualité que pour les autres valeurs de $\tau$ même s'il reste relativement proche
+* Pour $\tau = 0.275$, la trace de la chaine mélange rapidement, l'autocorrélation décroît très rapidement. L'histogramme est très proche de celui pour $\tau = 0.1$, cependant la taille de l'ESS est beaucoup plus importante avec respectivement 2900 contre 1900.
+
+Pour la suite nous utiliserons $\tau = 0.275$. La figure suivante illustre la distribution de tirage de loi de $\alpha$ à postériorie pour différents paramètres de la loi à priori $\Gamma$:
+
+
+```{r , echo=FALSE,fig.width=18,fig.height=15, warning=FALSE}
+
+vect_a = c(1,3,5,7,10)
+vect_b = c(1,3,5,7,10)
+
+ls_MH.alpha = list()
+ls_MH.graphs = list()
+countMH = 1
+niter = 2e4
+
+      if (Load_data) {
+  load(file="ls_MH.alpha")
+      }
+
+for (i in 1:NROW(vect_a)) {
+    for (j in 1:NROW(vect_b)) {
+      
+      if (!Load_data) {
+      ls_MH.alpha[[countMH]] = MH(alpha0=0.1, y,niter, tau=0.275, a=vect_a[i], b=vect_b[j])
+      }
+      
+      df_alpha = data.frame(alpha = ls_MH.alpha[[countMH]][1000:niter])
+      
+      CI1 = round(hdi(df_alpha)[1],3)
+      CI2 = round(hdi(df_alpha)[2],3)
+      alphaM = round(mean(df_alpha$alpha),3) 
+      
+      
+      ls_MH.graphs[[countMH]] = ggplot(df_alpha, aes(x = alpha)) +
+                                geom_histogram(aes(y=..density..),na.rm=T,col="#113DAC",fill="#5267F7")+
+                                geom_density(alpha=0.2,na.rm=T,fill="#FF6666")+
+                                theme_classic()+
+                                geom_vline(aes(xintercept=mean(alpha)),color="red", linetype="dashed", size=1)+
+                                geom_segment(aes(x = hdi(df_alpha)[1], xend = hdi(df_alpha)[2], y = 1 , yend =1),linetype = 1, size = 2)+
+                                labs(title = bquote("Prior"~Gamma~"("~.(vect_a[i])~","~.(vect_b[j])~")"),
+                                     subtitle = bquote(alpha[m]==.(alphaM)~" , "~CI[0.95]==~"("~.(CI1)~","~.(CI2)~")"))
+      countMH = countMH +1
+    }
+  
+}
+
+
+grid.arrange(
+ls_MH.graphs[[1]],
+ls_MH.graphs[[2]],
+ls_MH.graphs[[3]],
+ls_MH.graphs[[4]],
+ls_MH.graphs[[5]],
+ls_MH.graphs[[6]],
+ls_MH.graphs[[7]],
+ls_MH.graphs[[8]],
+ls_MH.graphs[[9]],
+ls_MH.graphs[[10]],
+ls_MH.graphs[[11]],
+ls_MH.graphs[[12]],
+ls_MH.graphs[[13]],
+ls_MH.graphs[[14]],
+ls_MH.graphs[[15]],
+ls_MH.graphs[[16]],
+ls_MH.graphs[[17]],
+ls_MH.graphs[[18]],
+ls_MH.graphs[[19]],
+ls_MH.graphs[[20]],
+ls_MH.graphs[[21]],
+ls_MH.graphs[[22]],
+ls_MH.graphs[[23]],
+ls_MH.graphs[[24]],
+ls_MH.graphs[[25]],
+
+nrow = 5,
+top= bquote("Tirage à Postériorie de "~alpha)
+  
+)
+```
+
+
+Nous constatons que les distributions sont toutes similaires pour différentes valeurs de paramètres de la prior. Ce qui est attendu et permet de se rassurer sur la validité des algorithmes implémentés.
+
+**Intervales de crédibilité à 95% :**
+
+* Pour $\Gamma(1,1)$ en prior: $\alpha = 0.4681361 ;  CI_{0.95}(\alpha) = (0.3066301, 0.6535263)$
+* Pour tous les 25 tirages avec des paramètres de la prior $\Gamma$ différents: $\alpha = 0.4704288 , CI_{0.95}(\alpha) = (0.3070352, 0.6485245 )$
+
+
+## 2.8 - Tirages sur les données des matières Mathématiques et Anglais uniquement
+
+Nous recommençons la procédure précédente pour les données de `Barre` de Mathématiques et Anglais.
+le jeu de données étant largement plus petit, les valeurs de $\tau = 0.6$ est réajusté pour obtenir environ 23% de taux d'acceptation. On choisie $\Gamma(1,1)$ comme prior.
+
+
+```{r , echo=FALSE, warning=FALSE,include =FALSE}
+
+      if (Load_data) {
+  load(file="alpha_math")
+  load(file="alpha_anglais")
+      }
+
+
+
+      if (!Load_data) {
+alpha_math = MH(alpha0=0.1, y_math,niter, tau=0.6, a=1, b=1)
+alpha_anglais = MH(alpha0=0.1, y_anglais,niter, tau=0.6, a=1, b=1)
+      }
+
+df_aan = data.frame(
+  alpha = c(alpha_math,alpha_anglais),
+  Matiere = c(rep("MATHS",NROW(alpha_math)),rep("ANGLAIS",NROW(alpha_anglais)))
+  )
+
+
+hdi(alpha_math)
+mean(alpha_math)
+print("---")
+hdi(alpha_anglais)
+mean(alpha_anglais)
+
+```
+
+Les densités des tirages de $\alpha$ pour les deux matières, dans la figure ci-dessous, se recouvrent presque parfaitement.
+
+```{r , echo=FALSE}
+ggplot(df_aan, aes(x = alpha, fill = Matiere )) +
+  geom_density(alpha=0.5,na.rm=T)+
+  theme_classic()
+```
+
+
+Nous trouvons pour les deux matières:
+
+$\alpha_{maths} = 0.5583876 , CI_{0.95}(\alpha) = (0.2413205 ,0.8972745 ))$
+$\alpha_{anglais} = 0.5388604 , CI_{0.95}(\alpha) = (0.2324066, 0.8941443 ))$
+
+Au vu des valeurs de $\alpha$ sont proches et les grands intervalles de confiances qui se reçoivent également presque parfaitement, nous estimons que $\alpha_{maths} = \alpha_{anglais}$
+
+Nous pouvons également vérifier que les distributions de $\alpha$ sont similaires on peut également utiliser le test de Kolmogorov-Smirnov (car $\alpha$ est continue):
+
+```{r , echo=FALSE}
+ks.test(alpha_anglais,alpha_math)
+```
+
+Le test indique que les deux distributions pour $\alpha_{maths}$ et $\alpha_{anglais}$ sont identiques.
+
+Nous pouvons également tracer la densité d'un tirage de loi de Pareto avec les paramètres $\alpha_{moyen} = 0.548624$ et $m=21$ et comparer avec les distributions de `Barre` pour Maths et Anglais:
+
+
+```{r , echo=FALSE}
+
+y_math = mut_nodup %>% filter(Matiere=="MATHS") %>% pull(Barre)
+y_anglais = mut_nodup %>% filter(Matiere=="ANGLAIS") %>% pull(Barre)
+
+
+if (Load_data) {
+  load(file= "pareto_ANMA")
+}
+
+if (!Load_data) {
+  pareto_ANMA = rpareto(1000, scale = 21, shape = 0.548624 )
+}
+
+df_BarreANMA = data.frame(
+  Barre = c(y_math,y_anglais,pareto_ANMA),
+  Matiere = c(rep("MATHS",NROW(y_math)),rep("ANGLAIS",NROW(y_anglais)),rep("Pareto(0.548624,21)",NROW(pareto_ANMA)))
+  )
+
+
+ggplot(df_BarreANMA, aes(x = Barre, fill = Matiere )) +
+  geom_density(alpha=0.5,na.rm=T)+
+  theme_classic()+
+  xlim(0,2000)
+
+```
+
+La forme des trois distributions (donnée pas le paramètre $\alpha$) est très proche. L'échelle de la distribution de Pareto calculé avec $m=21$ semble être différents de celle des matières. 
+
+Le paramètre $m$ peut s'interpréter comme la "Barre" représentée par le pic de la distribution de Pareto. Dans les faits il dont être au moins supérieur au minimum de la variable `Barre`, car cela représente le minimum des tirages de Pareto.
+
+Pour conclure, il paraît raisonnable de penser que le paramètre $m$ est bien estimé à 21 car s'il était plus grand, bien que le pic de la distribution de Pareto serait plus proche des pics de Maths en Anglais, la distribution ne pourrait pas générer de valeur en dessous du paramètre $m$ alors que les Barre de que le minimum de Barre pour les matières est de 21. 
+
+Concernant le paramètre $\alpha$, il, la convergence de la procédure et la représentation graphique indiquent également qu'il a bien été estimé. Cependant les distributions des matières et de la loi de Pareto généré avec ces paramètres ne coïncident pas: Pareto semble être décalé vers la gauche.
+On est tout de même satisfait du résultat car on a réussi à bien approché la distribution d'un phénomène découlant d'un mécanisme sociologique par une formule mathématique. La distribution de Pareto, que l'on doit à Vilfredo Pareto, est d'ailleurs utilisé avec succès pour modéliser de nombreux phénomènes sociologiques.
+
+
+
+
